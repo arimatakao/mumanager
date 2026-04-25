@@ -1,0 +1,29 @@
+# Local tool state
+.codex
+.claude
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.swp
+*~
+
+# Test and local media files
+*.mp3
+*.flac
+*.wav
+*.ogg
+*.oga
+*.opus
+*.m4a
+*.aac
+*.alac
+*.wma
+*.aiff
+*.aif
+*.ape
+
+# Local playlists
+*.m3u
+*.m3u8
