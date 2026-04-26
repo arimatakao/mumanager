@@ -3,6 +3,9 @@
 set -o pipefail
 
 SCAN_DIR="$PWD"
+PAUSE_AFTER_ACTION=1
+LOOP_PLAYLISTS=1
+CLEAR_HEADER=1
 
 AUDIO_EXTENSIONS=(
   mp3 flac wav ogg oga opus m4a aac alac wma aiff aif ape
@@ -14,6 +17,10 @@ die() {
 }
 
 pause() {
+  if (( ! PAUSE_AFTER_ACTION )); then
+    return 0
+  fi
+
   printf '\nPress Enter to continue...'
   read -r _
 }
@@ -24,8 +31,41 @@ check_metadata_dependencies() {
 }
 
 print_header() {
-  clear
+  (( CLEAR_HEADER )) && clear
   printf 'Scan directory: %s\n\n' "$(display_path "$SCAN_DIR")"
+}
+
+show_help() {
+  cat <<'EOF'
+MuManager scans a directory for music files, shows file and metadata tables,
+and helps view or edit local M3U/M3U8 playlists.
+
+Project: https://github.com/arimatakao/mumanager
+
+Usage: mumanager.sh [OPTIONS] [ACTIONS]
+
+Options:
+  -d, --dir DIR              Set directory to scan
+  -h, --help                 Show this help
+
+Actions:
+  -c, --change-dir           Change scan directory interactively
+  -t, --table                View music table
+      --music-table
+  -f, --files                View music files (fast scan)
+      --view-files
+  -p, --playlist             View playlist
+      --view-playlist
+  -e, --edit-playlist        Edit playlist
+      --edit
+  -m, --menu                 Open interactive menu
+
+If no action is provided, the interactive menu is opened.
+Examples:
+  ./mumanager.sh -d ~/Music -f
+  ./mumanager.sh --dir ~/Music --table
+  ./mumanager.sh -d ~/Music --playlist
+EOF
 }
 
 show_menu() {
@@ -574,6 +614,7 @@ edit_playlist() {
     local playlist_path
     select_playlist playlist_path || return
     run_playlist_editor "$playlist_path"
+    (( LOOP_PLAYLISTS )) || return
   done
 }
 
@@ -596,6 +637,7 @@ view_playlist() {
       printf 'Failed to enter playlist directory.\n'
       rm -f "$tmp"
       pause
+      (( LOOP_PLAYLISTS )) || return
       continue
     }
 
@@ -645,6 +687,7 @@ view_playlist() {
 
     rm -f "$tmp"
     pause
+    (( LOOP_PLAYLISTS )) || return
   done
 }
 
@@ -671,7 +714,84 @@ change_scan_dir() {
   }
 }
 
-main() {
+set_scan_dir() {
+  local new_dir="$1"
+
+  [[ -n "$new_dir" ]] || die 'directory path is required.'
+  [[ -d "$new_dir" ]] || die "directory does not exist: $new_dir"
+
+  SCAN_DIR=$(cd "$new_dir" && pwd) || die "failed to enter directory: $new_dir"
+}
+
+run_action() {
+  case "$1" in
+    change-dir) change_scan_dir ;;
+    table) view_songs ;;
+    files) view_music_files ;;
+    playlist) view_playlist ;;
+    edit-playlist) edit_playlist ;;
+    menu) main_loop ;;
+    *) die "unknown action: $1" ;;
+  esac
+}
+
+parse_arguments() {
+  ACTIONS=()
+
+  while (($#)); do
+    case "$1" in
+      -d|--dir)
+        shift
+        (($#)) || die 'missing directory after -d/--dir.'
+        set_scan_dir "$1"
+        ;;
+      --dir=*)
+        set_scan_dir "${1#*=}"
+        ;;
+      -h|--help)
+        show_help
+        exit 0
+        ;;
+      -c|--change-dir)
+        ACTIONS+=(change-dir)
+        ;;
+      -t|--table|--music-table)
+        ACTIONS+=(table)
+        ;;
+      -f|--files|--view-files)
+        ACTIONS+=(files)
+        ;;
+      -p|--playlist|--view-playlist)
+        ACTIONS+=(playlist)
+        ;;
+      -e|--edit-playlist|--edit)
+        ACTIONS+=(edit-playlist)
+        ;;
+      -m|--menu)
+        ACTIONS+=(menu)
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        die "unknown option: $1"
+        ;;
+      *)
+        die "unknown argument: $1"
+        ;;
+    esac
+    shift
+  done
+
+  (($# == 0)) || die "unknown argument: $1"
+}
+
+main_loop() {
+  PAUSE_AFTER_ACTION=1
+  LOOP_PLAYLISTS=1
+  CLEAR_HEADER=1
+
   while true; do
     show_menu
     local choice
@@ -686,6 +806,24 @@ main() {
       0) printf 'Goodbye!\n'; exit 0 ;;
       *) printf '\nUnknown option: %s\n' "$choice"; pause ;;
     esac
+  done
+}
+
+main() {
+  parse_arguments "$@"
+
+  if (( ${#ACTIONS[@]} == 0 )); then
+    main_loop
+    return
+  fi
+
+  PAUSE_AFTER_ACTION=0
+  LOOP_PLAYLISTS=0
+  CLEAR_HEADER=0
+
+  local action
+  for action in "${ACTIONS[@]}"; do
+    run_action "$action"
   done
 }
 
