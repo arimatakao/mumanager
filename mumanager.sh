@@ -36,6 +36,7 @@ show_menu() {
   printf '  2) View music table\n'
   printf '  3) View music files (fast scan)\n'
   printf '  4) View playlist\n'
+  printf '  5) Edit playlist\n'
   printf '  0) Exit\n\n'
   printf 'Your choice: '
 }
@@ -315,6 +316,268 @@ resolve_playlist_track() {
   esac
 }
 
+canonical_path() {
+  local path="$1"
+
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -m "$path"
+  else
+    local dir base
+    dir=$(dirname "$path")
+    base=$(basename "$path")
+    printf '%s/%s' "$(cd "$dir" 2>/dev/null && pwd -P)" "$base"
+  fi
+}
+
+relative_playlist_entry() {
+  local playlist_dir="$1"
+  local file="$2"
+
+  if command -v realpath >/dev/null 2>&1; then
+    realpath --relative-to="$playlist_dir" "$file" 2>/dev/null && return
+  fi
+
+  printf '%s' "$file"
+}
+
+collect_audio_files() {
+  local -n files_ref=$1
+  local -a FIND_ARGS
+  build_find_args
+
+  mapfile -d '' -t files_ref < <(find "$SCAN_DIR" -type f "${FIND_ARGS[@]}" -print0 2>/dev/null | sort -z)
+}
+
+load_playlist_selection() {
+  local playlist_path="$1"
+  local -n selected_ref=$2
+
+  local playlist_dir line track_path canonical
+  playlist_dir=$(cd "$(dirname "$playlist_path")" && pwd) || return 1
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line%$'\r'}
+    [[ -z "$line" || "$line" == \#* ]] && continue
+
+    track_path=$(resolve_playlist_track "$playlist_dir" "$line")
+    [[ -z "$track_path" || ! -f "$track_path" ]] && continue
+
+    canonical=$(canonical_path "$track_path")
+    selected_ref["$canonical"]=1
+  done <"$playlist_path"
+}
+
+shorten_text() {
+  local text="$1"
+  local width="$2"
+
+  if (( width <= 0 )); then
+    printf ''
+  elif (( ${#text} <= width )); then
+    printf '%s' "$text"
+  elif (( width <= 3 )); then
+    printf '%.*s' "$width" "$text"
+  else
+    printf '%.*s...' "$((width - 3))" "$text"
+  fi
+}
+
+draw_playlist_editor() {
+  local playlist_path="$1"
+  local cursor="$2"
+  local offset="$3"
+  local changed="$4"
+  local -n files_ref=$5
+  local -n selected_ref=$6
+
+  local rows cols visible_rows end i file canonical marker pointer status path_width
+  rows=$(tput lines 2>/dev/null || printf 24)
+  cols=$(tput cols 2>/dev/null || printf 80)
+  visible_rows=$(( rows - 8 ))
+  (( visible_rows < 5 )) && visible_rows=5
+  end=$(( offset + visible_rows ))
+  (( end > ${#files_ref[@]} )) && end=${#files_ref[@]}
+  path_width=$(( cols - 12 ))
+  (( path_width < 20 )) && path_width=20
+
+  print_header
+  printf 'Editing playlist: %s\n' "$(display_path "$playlist_path")"
+  printf 'Keys: j/k move, g/G top/bottom, Ctrl-D/Ctrl-U page, Space toggle, s save, q cancel\n\n'
+  printf '    Sel  File\n'
+
+  for (( i = offset; i < end; i++ )); do
+    file="${files_ref[$i]}"
+    canonical=$(canonical_path "$file")
+    marker='[ ]'
+    [[ -n "${selected_ref[$canonical]+x}" ]] && marker='[x]'
+    pointer=' '
+    (( i == cursor )) && pointer='>'
+    printf '%s %s  %s\n' "$pointer" "$marker" "$(shorten_text "$(display_path "$file")" "$path_width")"
+  done
+
+  printf '\n'
+  status='saved'
+  (( changed )) && status='modified'
+  printf 'Track %d/%d, playlist %s.\n' "$(( cursor + 1 ))" "${#files_ref[@]}" "$status"
+}
+
+write_playlist_selection() {
+  local playlist_path="$1"
+  local -n files_ref=$2
+  local -n selected_ref=$3
+
+  local playlist_dir tmp file canonical
+  playlist_dir=$(cd "$(dirname "$playlist_path")" && pwd) || return 1
+  tmp=$(mktemp) || die 'failed to create a temporary file.'
+
+  printf '#EXTM3U\n' >"$tmp"
+  for file in "${files_ref[@]}"; do
+    canonical=$(canonical_path "$file")
+    [[ -z "${selected_ref[$canonical]+x}" ]] && continue
+    printf '%s\n' "$(relative_playlist_entry "$playlist_dir" "$file")" >>"$tmp"
+  done
+
+  mv "$tmp" "$playlist_path"
+}
+
+collect_playlist_changes() {
+  local -n files_ref=$1
+  local -n original_ref=$2
+  local -n selected_ref=$3
+  local -n added_ref=$4
+  local -n removed_ref=$5
+
+  local file canonical
+  added_ref=()
+  removed_ref=()
+
+  for file in "${files_ref[@]}"; do
+    canonical=$(canonical_path "$file")
+    if [[ -n "${selected_ref[$canonical]+x}" && -z "${original_ref[$canonical]+x}" ]]; then
+      added_ref+=("$file")
+    elif [[ -z "${selected_ref[$canonical]+x}" && -n "${original_ref[$canonical]+x}" ]]; then
+      removed_ref+=("$file")
+    fi
+  done
+}
+
+print_changed_files() {
+  local title="$1"
+  shift
+
+  printf '%s (%d):\n' "$title" "$#"
+  if (( $# == 0 )); then
+    printf '  -\n'
+    return
+  fi
+
+  local file
+  for file in "$@"; do
+    printf '  %s\n' "$(display_path "$file")"
+  done
+}
+
+run_playlist_editor() {
+  local playlist_path="$1"
+  local -a files
+  local -A original selected
+
+  collect_audio_files files
+  print_header
+  if (( ${#files[@]} == 0 )); then
+    printf 'No music files found in directory: %s\n' "$(display_path "$SCAN_DIR")"
+    pause
+    return
+  fi
+
+  load_playlist_selection "$playlist_path" original
+  load_playlist_selection "$playlist_path" selected
+
+  local cursor=0 offset=0 changed=0 rows visible_rows key old_stty
+  old_stty=$(stty -g)
+  trap 'stty "$old_stty"; trap - INT TERM; return 130' INT TERM
+  stty -echo -icanon time 0 min 1
+
+  while true; do
+    rows=$(tput lines 2>/dev/null || printf 24)
+    visible_rows=$(( rows - 8 ))
+    (( visible_rows < 5 )) && visible_rows=5
+    (( cursor < offset )) && offset=$cursor
+    (( cursor >= offset + visible_rows )) && offset=$(( cursor - visible_rows + 1 ))
+    (( offset < 0 )) && offset=0
+
+    draw_playlist_editor "$playlist_path" "$cursor" "$offset" "$changed" files selected
+
+    IFS= read -r -s -n 1 key
+    case "$key" in
+      j)
+        (( cursor < ${#files[@]} - 1 )) && cursor=$(( cursor + 1 ))
+        ;;
+      k)
+        (( cursor > 0 )) && cursor=$(( cursor - 1 ))
+        ;;
+      g)
+        cursor=0
+        ;;
+      G)
+        cursor=$(( ${#files[@]} - 1 ))
+        ;;
+      $'\004')
+        cursor=$(( cursor + visible_rows / 2 ))
+        (( cursor > ${#files[@]} - 1 )) && cursor=$(( ${#files[@]} - 1 ))
+        ;;
+      $'\025')
+        cursor=$(( cursor - visible_rows / 2 ))
+        (( cursor < 0 )) && cursor=0
+        ;;
+      ' ')
+        local canonical
+        canonical=$(canonical_path "${files[$cursor]}")
+        if [[ -n "${selected[$canonical]+x}" ]]; then
+          unset 'selected[$canonical]'
+        else
+          selected["$canonical"]=1
+        fi
+        changed=1
+        ;;
+      s)
+        local -a added removed
+        collect_playlist_changes files original selected added removed
+        stty "$old_stty"
+        trap - INT TERM
+        write_playlist_selection "$playlist_path" files selected
+        print_header
+        printf 'Playlist saved: %s\n\n' "$(display_path "$playlist_path")"
+        print_changed_files 'Added files' "${added[@]}"
+        printf '\n'
+        print_changed_files 'Removed files' "${removed[@]}"
+        pause
+        return
+        ;;
+      q)
+        stty "$old_stty"
+        trap - INT TERM
+        print_header
+        if (( changed )); then
+          printf 'Changes discarded.\n'
+        else
+          printf 'No changes made.\n'
+        fi
+        pause
+        return
+        ;;
+    esac
+  done
+}
+
+edit_playlist() {
+  while true; do
+    local playlist_path
+    select_playlist playlist_path || return
+    run_playlist_editor "$playlist_path"
+  done
+}
+
 view_playlist() {
   check_metadata_dependencies
 
@@ -420,6 +683,7 @@ main() {
       2) view_songs ;;
       3) view_music_files ;;
       4) view_playlist ;;
+      5) edit_playlist ;;
       0) printf 'Goodbye!\n'; exit 0 ;;
       *) printf '\nUnknown option: %s\n' "$choice"; pause ;;
     esac
