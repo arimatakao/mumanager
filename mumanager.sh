@@ -80,6 +80,43 @@ show_menu() {
   printf 'Your choice: '
 }
 
+print_goodbye() {
+  local phrases=(
+    'Let it be.'
+    'Here comes the sun.'
+    'We will rock you.'
+    'The show must go on.'
+    'Nothing else matters.'
+    'Smells like teen spirit.'
+    "Hey ho, let's go!"
+    'No woman, no cry.'
+    'What a wonderful world.'
+    'I got you, babe.'
+    'Imagine.'
+    'Born to run.'
+    'Purple rain.'
+    'Sweet dreams are made of this.'
+    'I will survive.'
+    'We are the champions.'
+    'Come as you are.'
+    'Like a rolling stone.'
+    'Should I stay or should I go?'
+    'Hit the road, Jack.'
+    'All you need is love.'
+    'Let there be rock.'
+    'Get up, stand up.'
+    'Every little thing is gonna be alright.'
+    'Good vibrations.'
+    'Walk this way.'
+    'Respect.'
+    'Dream on.'
+    'Start me up.'
+    'Hello, goodbye.'
+  )
+
+  printf '%s\n' "${phrases[RANDOM % ${#phrases[@]}]}"
+}
+
 build_find_args() {
   FIND_ARGS=('(')
 
@@ -803,7 +840,7 @@ main_loop() {
       3) view_music_files ;;
       4) view_playlist ;;
       5) edit_playlist ;;
-      0) printf 'Goodbye!\n'; exit 0 ;;
+      0) print_goodbye; exit 0 ;;
       *) printf '\nUnknown option: %s\n' "$choice"; pause ;;
     esac
   done
