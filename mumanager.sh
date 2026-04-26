@@ -25,7 +25,6 @@ check_metadata_dependencies() {
 
 print_header() {
   clear
-  printf 'MuManager - music and Extended M3U manager ( https://github.com/arimatakao/mumanager )\n'
   printf 'Scan directory: %s\n\n' "$(display_path "$SCAN_DIR")"
 }
 
