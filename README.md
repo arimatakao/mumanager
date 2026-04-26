@@ -20,7 +20,25 @@ MuManager uses:
 
 ## Usage
 
-Make the script executable:
+Install with one command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/arimatakao/mumanager/main/install.sh | bash
+```
+
+For a system-wide install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/arimatakao/mumanager/main/install.sh | sudo bash -s -- --system
+```
+
+After installation, run:
+
+```bash
+mumanager
+```
+
+For local development, make the script executable:
 
 ```bash
 chmod +x mumanager.sh
