@@ -26,8 +26,8 @@ pause() {
 }
 
 check_metadata_dependencies() {
-  command -v ffprobe >/dev/null 2>&1 || die 'ffprobe from the FFmpeg package is required.'
-  command -v jq >/dev/null 2>&1 || die 'jq is required to read metadata.'
+  command -v exiftool >/dev/null 2>&1 || die 'exiftool is required to read metadata.'
+  command -v jaq >/dev/null 2>&1 || die 'jaq is required to process metadata.'
 }
 
 print_header() {
@@ -39,6 +39,8 @@ show_help() {
   cat <<'EOF'
 MuManager scans a directory for music files, shows file and metadata tables,
 and helps view or edit local M3U/M3U8 playlists.
+
+Dependencies: exiftool, jaq (for metadata); column, realpath (optional).
 
 Project: https://github.com/arimatakao/mumanager
 
@@ -133,40 +135,6 @@ build_find_args() {
   FIND_ARGS+=(')')
 }
 
-format_duration() {
-  local raw="$1"
-  if [[ -z "$raw" || "$raw" == "null" ]]; then
-    printf '-'
-    return
-  fi
-
-  local seconds
-  seconds=$(printf '%.0f' "$raw" 2>/dev/null) || {
-    printf '-'
-    return
-  }
-
-  local hours=$(( seconds / 3600 ))
-  local minutes=$(( (seconds % 3600) / 60 ))
-  local secs=$(( seconds % 60 ))
-
-  if (( hours > 0 )); then
-    printf '%d:%02d:%02d' "$hours" "$minutes" "$secs"
-  else
-    printf '%d:%02d' "$minutes" "$secs"
-  fi
-}
-
-format_bitrate() {
-  local raw="$1"
-  if [[ -z "$raw" || "$raw" == "null" || "$raw" == "0" ]]; then
-    printf '-'
-    return
-  fi
-
-  printf '%s kbps' "$(( (raw + 500) / 1000 ))"
-}
-
 format_size() {
   local bytes="$1"
   if [[ -z "$bytes" || "$bytes" == "null" ]]; then
@@ -197,60 +165,30 @@ display_path() {
   fi
 }
 
-metadata_field() {
-  local json="$1"
-  local field="$2"
-  local fallback="$3"
+batch_song_rows() {
+  local argfile
+  argfile=$(mktemp) || die 'failed to create a temporary file.'
+  printf '%s\n' "$@" >"$argfile"
 
-  jq -r --arg field "$field" --arg fallback "$fallback" '
-    def tag($names):
-      (.format.tags // {}) as $tags
-      | reduce $names[] as $name (null; . // $tags[$name]);
+  exiftool -json \
+    -Title -FileName \
+    -Composer -Artist -AlbumArtist \
+    -Album -Duration -AudioBitrate -FileSize \
+    -Lyrics -UnsynchronisedLyrics \
+    -@ "$argfile" 2>/dev/null | \
+  jaq -r '
+    def scalar: if type == "array" then join(", ") else . end;
+    sort_by((.Title // .FileName // "") | tostring | ascii_downcase) | .[] | [
+      (.Title // .FileName // "-" | scalar),
+      (.Composer // .Artist // .AlbumArtist // "-" | scalar),
+      (.Album // "-" | scalar),
+      (.AudioBitrate // "-" | scalar),
+      (if ((.Lyrics // .UnsynchronisedLyrics // "") | scalar | length) > 0 then "yes" else "no" end),
+      (.Duration // "-" | scalar),
+      (.FileSize // "-" | scalar | .[0:8])
+    ] | @tsv'
 
-    if $field == "title" then
-      tag(["title", "TITLE"]) // $fallback
-    elif $field == "composer" then
-      tag(["composer", "COMPOSER", "artist", "ARTIST", "album_artist", "ALBUMARTIST"]) // "-"
-    elif $field == "album" then
-      tag(["album", "ALBUM"]) // "-"
-    elif $field == "duration" then
-      .format.duration // ""
-    elif $field == "bit_rate" then
-      .format.bit_rate // ""
-    elif $field == "size" then
-      .format.size // ""
-    elif $field == "lyrics" then
-    if (
-        tag([
-          "lyrics", "LYRICS",
-          "unsyncedlyrics", "UNSYNCEDLYRICS", "UNSYNCED LYRICS",
-          "syncedlyrics", "SYNCEDLYRICS", "SYNCED LYRICS"
-        ]) // ""
-      ) | length > 0 then "yes" else "no" end
-    else
-      "-"
-    end
-  ' <<<"$json"
-}
-
-song_row() {
-  local file="$1"
-  local json title composer album bit_rate duration size has_lyrics
-
-  json=$(ffprobe -v error \
-    -show_entries format=duration,bit_rate,size:format_tags \
-    -of json "$file" 2>/dev/null) || return 1
-
-  title=$(metadata_field "$json" title "$(basename "$file")")
-  composer=$(metadata_field "$json" composer "-")
-  album=$(metadata_field "$json" album "-")
-  bit_rate=$(format_bitrate "$(metadata_field "$json" bit_rate "")")
-  has_lyrics=$(metadata_field "$json" lyrics "-")
-  duration=$(format_duration "$(metadata_field "$json" duration "")")
-  size=$(format_size "$(metadata_field "$json" size "")")
-
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$title" "$composer" "$album" "$bit_rate" "$has_lyrics" "$duration" "$size"
+  rm -f "$argfile"
 }
 
 view_songs() {
@@ -259,36 +197,28 @@ view_songs() {
   print_header
   printf 'Scanning audio metadata...\n\n'
 
-  local tmp rows=0 skipped=0
-  tmp=$(mktemp) || die 'failed to create a temporary file.'
-  local -a FIND_ARGS
+  local -a files FIND_ARGS
   build_find_args
+  mapfile -d '' -t files < <(find "$SCAN_DIR" -type f "${FIND_ARGS[@]}" -print0 2>/dev/null | sort -z)
 
-  printf 'Track title\tComposer\tAlbum\tBitrate\tHas lyrics\tTrack length\tFile size\n' >"$tmp"
-
-  while IFS= read -r -d '' file; do
-    if song_row "$file" >>"$tmp"; then
-      rows=$((rows + 1))
-    else
-      skipped=$((skipped + 1))
-    fi
-  done < <(find "$SCAN_DIR" -type f "${FIND_ARGS[@]}" -print0 2>/dev/null | sort -z)
-
-  if (( rows == 0 )); then
+  if (( ${#files[@]} == 0 )); then
     printf 'No music files found in directory: %s\n' "$(display_path "$SCAN_DIR")"
+    pause
+    return
+  fi
+
+  local tmp
+  tmp=$(mktemp) || die 'failed to create a temporary file.'
+  printf 'Track title\tComposer\tAlbum\tBitrate\tHas lyrics\tLength\tSize\n' >"$tmp"
+  batch_song_rows "${files[@]}" >>"$tmp"
+
+  if command -v column >/dev/null 2>&1; then
+    column -t -s $'\t' -o ' │ ' "$tmp"
   else
-    if command -v column >/dev/null 2>&1; then
-      column -t -s $'\t' "$tmp"
-    else
-      cat "$tmp"
-    fi
-    printf '\nTotal files: %d\n' "$rows"
+    cat "$tmp"
   fi
 
-  if (( skipped > 0 )); then
-    printf 'Files skipped because metadata could not be read: %d\n' "$skipped"
-  fi
-
+  printf '\nTotal files: %d\n' "${#files[@]}"
   rm -f "$tmp"
   pause
 }
@@ -315,7 +245,7 @@ view_music_files() {
     printf 'No music files found in directory: %s\n' "$(display_path "$SCAN_DIR")"
   else
     if command -v column >/dev/null 2>&1; then
-      column -t -s $'\t' "$tmp"
+      column -t -s $'\t' -o ' │ ' "$tmp"
     else
       cat "$tmp"
     fi
@@ -665,14 +595,12 @@ view_playlist() {
     print_header
     printf 'Reading playlist: %s\n\n' "$(display_path "$playlist_path")"
 
-    local tmp rows=0 skipped=0 missing=0 unsupported=0 total_files=0
-    tmp=$(mktemp) || die 'failed to create a temporary file.'
-    printf 'Track title\tComposer\tAlbum\tBitrate\tHas lyrics\tTrack length\tFile size\n' >"$tmp"
-
     local playlist_dir line track_path
+    local -a track_files=()
+    local missing=0 unsupported=0 total_files=0
+
     playlist_dir=$(cd "$(dirname "$playlist_path")" && pwd) || {
       printf 'Failed to enter playlist directory.\n'
-      rm -f "$tmp"
       pause
       (( LOOP_PLAYLISTS )) || return
       continue
@@ -684,29 +612,33 @@ view_playlist() {
 
       track_path=$(resolve_playlist_track "$playlist_dir" "$line")
       if [[ -z "$track_path" ]]; then
-        unsupported=$((unsupported + 1))
+        unsupported=$(( unsupported + 1 ))
         continue
       fi
 
-      total_files=$((total_files + 1))
+      total_files=$(( total_files + 1 ))
 
       if [[ ! -f "$track_path" ]]; then
-        missing=$((missing + 1))
+        missing=$(( missing + 1 ))
         continue
       fi
 
-      if song_row "$track_path" >>"$tmp"; then
-        rows=$((rows + 1))
-      else
-        skipped=$((skipped + 1))
-      fi
+      track_files+=("$track_path")
     done <"$playlist_path"
 
-    if (( rows == 0 )); then
+    local tmp
+    tmp=$(mktemp) || die 'failed to create a temporary file.'
+    printf 'Track title\tComposer\tAlbum\tBitrate\tHas lyrics\tLength\tSize\n' >"$tmp"
+
+    if (( ${#track_files[@]} > 0 )); then
+      batch_song_rows "${track_files[@]}" >>"$tmp"
+    fi
+
+    if (( ${#track_files[@]} == 0 )); then
       printf 'No readable local music files found in playlist.\n'
     else
       if command -v column >/dev/null 2>&1; then
-        column -t -s $'\t' "$tmp"
+        column -t -s $'\t' -o ' │ ' "$tmp"
       else
         cat "$tmp"
       fi
@@ -717,9 +649,6 @@ view_playlist() {
 
     if (( unsupported > 0 )); then
       printf 'Unsupported remote playlist entries skipped: %d\n' "$unsupported"
-    fi
-    if (( skipped > 0 )); then
-      printf 'Files skipped because metadata could not be read: %d\n' "$skipped"
     fi
 
     rm -f "$tmp"
