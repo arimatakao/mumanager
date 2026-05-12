@@ -23,6 +23,7 @@
 *.aiff
 *.aif
 *.ape
+*.lrc
 
 # Local playlists
 *.m3u

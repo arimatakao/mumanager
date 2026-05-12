@@ -30,6 +30,11 @@ check_metadata_dependencies() {
   command -v jaq >/dev/null 2>&1 || die 'jaq is required to process metadata.'
 }
 
+check_lyrics_dependencies() {
+  check_metadata_dependencies
+  command -v curl >/dev/null 2>&1 || die 'curl is required to fetch lyrics.'
+}
+
 print_header() {
   (( CLEAR_HEADER )) && clear
   printf 'Scan directory: %s\n\n' "$(display_path "$SCAN_DIR")"
@@ -40,7 +45,7 @@ show_help() {
 MuManager scans a directory for music files, shows file and metadata tables,
 and helps view or edit local M3U/M3U8 playlists.
 
-Dependencies: exiftool, jaq (for metadata); column, realpath (optional).
+Dependencies: exiftool, jaq (for metadata); curl (for lyrics); column, realpath (optional).
 
 Project: https://github.com/arimatakao/mumanager
 
@@ -60,6 +65,8 @@ Actions:
       --view-playlist
   -e, --edit-playlist        Edit playlist
       --edit
+  -l, --lyrics               Fetch lyrics (.lrc) from lrclib.net
+      --fetch-lyrics
   -m, --menu                 Open interactive menu
 
 If no action is provided, the interactive menu is opened.
@@ -78,6 +85,7 @@ show_menu() {
   printf '  3) View music files (fast scan)\n'
   printf '  4) View playlist\n'
   printf '  5) Edit playlist\n'
+  printf '  6) Fetch lyrics (.lrc)\n'
   printf '  0) Exit\n\n'
   printf 'Your choice: '
 }
@@ -689,14 +697,178 @@ set_scan_dir() {
   SCAN_DIR=$(cd "$new_dir" && pwd) || die "failed to enter directory: $new_dir"
 }
 
+# Sets globals _LYRICS_TYPE (synced|plain) and _LYRICS_BODY on success, returns 0.
+# On failure sets _LYRICS_TYPE to an error token and returns 1.
+_query_lrclib() {
+  local file="$1"
+  _LYRICS_TYPE=''
+  _LYRICS_BODY=''
+
+  local meta
+  meta=$(exiftool -json -n -Title -Artist -AlbumArtist -Album -Duration "$file" 2>/dev/null | \
+    jaq -r 'if length > 0 then .[0] | [
+      (.Artist // .AlbumArtist // ""),
+      (.Title // ""),
+      (.Album // ""),
+      ((.Duration // 0) | if type == "number" then floor else 0 end | tostring)
+    ] | @tsv else "" end' 2>/dev/null) || { _LYRICS_TYPE='error'; return 1; }
+
+  [[ -z "$meta" ]] && { _LYRICS_TYPE='error'; return 1; }
+
+  local artist title album duration_secs
+  IFS=$'\t' read -r artist title album duration_secs <<< "$meta"
+
+  if [[ -z "$title" ]]; then
+    _LYRICS_TYPE='no title in metadata'
+    return 1
+  fi
+
+  local -a curl_args=(-s -G --max-time 15)
+  curl_args+=(--data-urlencode "track_name=$title")
+  [[ -n "$artist" ]] && curl_args+=(--data-urlencode "artist_name=$artist")
+  [[ -n "$album" ]] && curl_args+=(--data-urlencode "album_name=$album")
+  [[ "${duration_secs:-0}" != "0" ]] && curl_args+=(--data-urlencode "duration=$duration_secs")
+
+  local response http_code body
+  response=$(curl "${curl_args[@]}" -w $'\n%{http_code}' 'https://lrclib.net/api/get' 2>/dev/null)
+  http_code=$(printf '%s' "$response" | tail -n1)
+  body=$(printf '%s' "$response" | head -n -1)
+
+  if [[ "$http_code" != "200" ]]; then
+    _LYRICS_TYPE='not found'
+    return 1
+  fi
+
+  local synced plain
+  synced=$(printf '%s' "$body" | jaq -r '.syncedLyrics // empty' 2>/dev/null)
+  plain=$(printf '%s' "$body" | jaq -r '.plainLyrics // empty' 2>/dev/null)
+
+  if [[ -n "$synced" ]]; then
+    _LYRICS_TYPE='synced'
+    _LYRICS_BODY="$synced"
+    return 0
+  elif [[ -n "$plain" ]]; then
+    _LYRICS_TYPE='plain'
+    _LYRICS_BODY="$plain"
+    return 0
+  else
+    _LYRICS_TYPE='no lyrics in response'
+    return 1
+  fi
+}
+
+fetch_lyrics() {
+  check_lyrics_dependencies
+
+  local -a files FIND_ARGS
+  build_find_args
+  mapfile -d '' -t files < <(find "$SCAN_DIR" -type f "${FIND_ARGS[@]}" -print0 2>/dev/null | sort -z)
+
+  if (( ${#files[@]} == 0 )); then
+    print_header
+    printf 'No music files found in directory: %s\n' "$(display_path "$SCAN_DIR")"
+    pause
+    return
+  fi
+
+  local cols path_width
+  cols=$(tput cols 2>/dev/null || printf 80)
+  path_width=$(( cols - 16 ))
+  (( path_width < 30 )) && path_width=30
+
+  while true; do
+    print_header
+    printf 'Select a file to fetch lyrics for:\n\n'
+
+    local i file lrc_marker
+    for (( i = 0; i < ${#files[@]}; i++ )); do
+      file="${files[$i]}"
+      lrc_marker=''
+      [[ -f "${file%.*}.lrc" ]] && lrc_marker=' [lrc]'
+      printf '  %d) %s%s\n' \
+        "$(( i + 1 ))" \
+        "$(shorten_text "$(display_path "$file")" "$path_width")" \
+        "$lrc_marker"
+    done
+
+    printf '  0) Back\n\n'
+    printf 'Your choice: '
+
+    local choice
+    read -r choice
+
+    case "$choice" in
+      0)
+        return
+        ;;
+      ''|*[!0-9]*)
+        printf '\nUnknown option: %s\n' "$choice"
+        pause
+        continue
+        ;;
+      *)
+        if (( choice < 1 || choice > ${#files[@]} )); then
+          printf '\nUnknown option: %s\n' "$choice"
+          pause
+          continue
+        fi
+        ;;
+    esac
+
+    local selected="${files[$((choice - 1))]}"
+    local lrc_path="${selected%.*}.lrc"
+
+    print_header
+    printf 'Searching lyrics for: %s\n' "$(display_path "$selected")"
+    printf 'Querying lrclib.net...\n'
+
+    _query_lrclib "$selected"
+
+    if [[ -z "$_LYRICS_BODY" ]]; then
+      printf '\nResult: %s\n' "$_LYRICS_TYPE"
+      pause
+      continue
+    fi
+
+    local total_lines
+    total_lines=$(printf '%s\n' "$_LYRICS_BODY" | wc -l | tr -d ' ')
+
+    print_header
+    printf 'Lyrics preview (%s) — %s\n\n' "$_LYRICS_TYPE" "$(display_path "$selected")"
+    printf '%s\n' "$_LYRICS_BODY" | head -n 10
+    printf '\n... (%d lines total)\n' "$total_lines"
+
+    if [[ -f "$lrc_path" ]]; then
+      printf '\nNote: %s already exists and will be overwritten.\n' "$(display_path "$lrc_path")"
+    fi
+
+    printf '\nSave these lyrics? [y/N] '
+    local confirm
+    read -r confirm
+
+    case "$confirm" in
+      y|Y|yes|YES)
+        printf '%s\n' "$_LYRICS_BODY" > "$lrc_path"
+        printf '\nSaved: %s\n' "$(display_path "$lrc_path")"
+        pause
+        ;;
+      *)
+        printf '\nNot saved.\n'
+        pause
+        ;;
+    esac
+  done
+}
+
 run_action() {
   case "$1" in
-    change-dir) change_scan_dir ;;
-    table) view_songs ;;
-    files) view_music_files ;;
-    playlist) view_playlist ;;
+    change-dir)   change_scan_dir ;;
+    table)        view_songs ;;
+    files)        view_music_files ;;
+    playlist)     view_playlist ;;
     edit-playlist) edit_playlist ;;
-    menu) main_loop ;;
+    lyrics)       fetch_lyrics ;;
+    menu)         main_loop ;;
     *) die "unknown action: $1" ;;
   esac
 }
@@ -732,6 +904,9 @@ parse_arguments() {
         ;;
       -e|--edit-playlist|--edit)
         ACTIONS+=(edit-playlist)
+        ;;
+      -l|--lyrics|--fetch-lyrics)
+        ACTIONS+=(lyrics)
         ;;
       -m|--menu)
         ACTIONS+=(menu)
@@ -769,6 +944,7 @@ main_loop() {
       3) view_music_files ;;
       4) view_playlist ;;
       5) edit_playlist ;;
+      6) fetch_lyrics ;;
       0) print_goodbye; exit 0 ;;
       *) printf '\nUnknown option: %s\n' "$choice"; pause ;;
     esac
